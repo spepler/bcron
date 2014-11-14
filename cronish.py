@@ -1,19 +1,13 @@
 #!/usr/local/bin/python
 #
-#
 # python wrapper script to run a job repeatedly
-# Uses bsub to run jobs to make sure they continue
 
-# The script launches jobs and tells other intances of the script that it is looking after 
-# the job. If the script dies then another instance of the script (queued via bsub) will take 
-# over. 
- 
+# The script launches jobs and tells other instances of the script that it is looking after 
+# the job. The script can be started repeatedly from a cron job to make sure it does not die.
+# Only one instance of each job will be allowed to run.
 
-# communication between jobs is done via a file
-# if the file is untouched in last x mins the assume job is inactive and start more jobs.
-# 
+# communication between jobs is done via a lock file
 
-# 2 types of script use
 #  1. Startup 
 #       Makes the com file. 
 #       Starts a watcher script.
@@ -29,116 +23,107 @@
 #           the last job it has been freq since the last job start.
 #  wait - Minimum wait time between jobs. There should be at least wait between the 
 #           end of the last job and the start of the next.
-#  poll - The monitor polls the job and updates the com file at these intervals. 
-#           The watcher waits to to poll intervals to check the monitor is dead.
-#  watch - A watcher is started at these intervals. 
 #  script - the script to run.
 #  jobname - a unique name for the series of script runs.
 #
-#Types of behaviour 
-#Regular predictable freq=6
-#....XX....XX....XX....XX....
-#irreg job length freq=6 wait=0
-#....XX....X.....XXXX..XX....
-#irreg freq=6 wait=3
-#....xx....xxxxxxx...x.....x.....xxxxxxxxxxxxxxxxx...xx....x....
-#irreg job  freq=0 wait=5
+# Types of behaviour 
+# Regular job of predictable length, freq=6
+# ....XX....XX....XX....XX....
+# Irreg job length freq=6 wait=0
+# ....XX....X.....XXXX..XX....
+# Irreg freq=6 wait=3
+# ....xx....xxxxxxx...x.....x.....xxxxxxxxxxxxxxxxx...xx....x....
+# Irreg job  freq=0 wait=5
 # ...X.....XXXXX.....X.....XXXXXXX.....XX.....
 #
-# Job, Monitor and Watcher sequence
-# J  J  J  J  J  J  J  J  J  J           J  J  J  J  J  J  J  J  J   ...  
-# M                            X (dies)  M  
-# W             W            W           W (restart M)  W      
-# 
 #
 # Author: Sam Pepler
-# 2014 Aug
+# 2014 Aug - bcron
+# 2014 Nov - revised to work with cron as starter - cronish
 
 
 import time, os, subprocess, signal, sys, ConfigParser
-from plock import Plock, PlockPresent
 
-class Watcher:
+#-------------------------------------
+''' module plock: simple process locking.
+        this may be needed when more than one copy of a process is trying
+        to access the same files, such as during ingestion'''
 
-    def __init__(self, jobname, freq, script, options):
-        bcrondir = os.path.join(os.environ['HOME'], '.bcron')
-        jobfile = os.path.join(bcrondir, jobname)
-        v = options.verbose
-        poll = options.poll
-        wait = options.wait
-        watch = options.watch
-        timeout = options.timeout
-        
-        # die if no job file
-        if v: print "WATCHER: Starting watcher process to check if the monitor is running..."
-        if not os.path.exists(jobfile): 
-            print "WATCHER: no job file (%s). Stopping." % jobfile
-            sys.exit()
-        
-        # schedule next watcher job
-        if v: print "WATCHER: scheduling next watcher run with command: "
-        cmd = 'sleep %s && python bcron.py --restarter --watch=%s %s -p%s -w%s -t%s %s %s \'%s\'  &' % (watch,
-            watch, '-v '*v, poll, wait, timeout, jobname, freq, script)
-        if v: print "WATCHER:       %s" % cmd    
-        subprocess.call(cmd, shell=True)
-        if v: print "WATCHER: Next watcher job queued."
-           
-        # if the monitor has failed then continue as the monitor 
-        if os.path.getmtime(jobfile) < time.time() - poll - freq - wait:
-            print "WATCHER: Take over as new monitor."
-            m = Monitor(jobname, freq, script, options)
-            m.start()   
-        else: 
-            if v: print "WATCHER: Monitor ok."
-        
+class PlockPresent(Exception): pass
 
+class Plock:
+    def __init__(self,filename):
+        self.filename = filename
+        pid = self._haslock()
+        if pid !=0 : raise PlockPresent("locked by process: %d" % pid)
+        else: self.lock()
+            
+    def _haslock(self):
+        ''' _haslock check for existence of file and check process id'''
+        if os.path.islink(self.filename):
+            pid = int(os.readlink(self.filename))
+            # test to see if process is running            
+            try:
+                os.kill(pid, 0)
+                return pid
+            except OSError:
+                # stale lock
+                self.release()
+        return 0
     
+    def lock(self):
+        ''' lock create lock file and write current process id '''
+        pid = os.getpid()
+        os.symlink("%d" % pid, self.filename)
+        
+    def release(self):
+        ''' release remove lock file to release lock'''
+        os.unlink(self.filename)
+
+  
 #----------------------------------------------
 class Monitor:
+    '''Class to repeated run jobs then wait to run next job'''
 
-    def __init__(self,jobname, freq, script, verbose, poll, timeout, wait):
-        self.beat=0
+    def __init__(self,jobname, freq, script, verbose, timeout, wait):
+        self.polls=0
         self.verbose = verbose
-        self.poll = poll
         self.timeout = timeout
         self.wait = wait
         self.freq=freq
 	self.script=script
         self.jobname = jobname
-
-    def heartbeat(self): 
-        self.beat += 1
-        print "MONITOR: Beat %s\r" %self.beat,
-        sys.stdout.flush()
+        self.started = time.time()
+        self.jobs=0
 
     def start(self):
-        self.heartbeat()
+        
         while 1:
-            job = Job(self.script, self.poll, self.timeout, self.heartbeat) 
-            if self.verbose: print "MONITOR: Start job"
+            job = Job(self.script, self.timeout)
+            self.jobs +=1 
+            if self.verbose: print "MONITOR: Start job %s: %s" % (self.jobs, self.script)
             job.do()
-            if self.verbose: print "\nMONITOR: End job"
+            if self.verbose: print "\nMONITOR: End job %s" % self.jobs
+
+            # time of next job
             nextjobstart = max(job.start_time+self.freq, job.end_time+self.wait)
             if self.verbose: print "MONITOR: Waiting %s seconds before starting new run." % (nextjobstart - time.time(),) 
-            while time.time() < nextjobstart:
-                time.sleep(self.poll)
-                self.heartbeat()
+            time.sleep(nextjobstart - time.time())  
                                     
 
 
 #-------------------------------
 class Job: 
 
-    def __init__(self,script, poll, timeout, heartbeat):
+    def __init__(self,script, timeout):
         self.start_time=time.time()
-        self.poll = poll
+        self.polls = 0
         self.timeout=timeout
 	self.process = subprocess.Popen(script, shell=True, bufsize=4096)
 	self.script=script
 	self.killed = 0
 	self.returncode = None
 	self.cwd = os.getcwd()
-        self.heartbeat = heartbeat
 
     def runtime(self): return time.time()-self.start_time
 
@@ -153,30 +138,36 @@ class Job:
 
     def do(self):
         #  loop until process stops.  If time out is reached kill process 
+        poll = 1.0
         while 1: 
 	    self.returncode = self.process.poll()
+	    self.polls +=1		
 	    if self.returncode == None and self.runtime() < self.timeout: 
-                self.heartbeat()
-	        time.sleep(self.poll)		
+	        time.sleep(poll)
+	        poll = 1.1*poll
 	    elif self.returncode == None: self.kill()
-	    else: break
-		
+	    else: break		
 	self.end_time=time.time()
-	self.heartbeat()
 
-
+#-----------------------------------
 from optparse import OptionParser
 
 def main():
-    usage = "usage: %prog [options] start|stop [<jobname1>, <jobname2>...]"
+    usage = """usage: %prog [options] start|stop <jobname1>
+  start        Starts job sequence. If the job is already going it will not start a new one"
+  stop         Stop a job sequence.     
+  -l, --list   list jobs in config file.
+  -v           verbose          """
     parser = OptionParser(usage)
     parser.add_option("-v", "--verbose", action="count", dest="verbose")
-    parser.add_option("-l", "--list", dest="list")
+    parser.add_option("-l", "--list", action="store_true", dest="list", help="list jobs")
     (options, args) = parser.parse_args()
 
     cronish_dir = os.path.join(os.environ['HOME'], '.cronish')
     if not os.path.exists(cronish_dir): os.mkdir(cronish_dir)       
     configfile = os.path.join(cronish_dir,'cronish.cfg')
+    if not os.path.exists(configfile): raise Exception("No cronish file: %s" % configfile)
+   
     
     if options.list:
         print 'job files: ', 
@@ -203,8 +194,11 @@ def main():
         if options.verbose: print "Stopping monitor."     
         if os.path.islink(lockfile):
             pid = int(os.readlink(lockfile))
-            if os.path.exists("/proc/%d" % pid):
+            try:
                 os.kill(pid, signal.SIGKILL)
+            except OSError:
+                # stale lock
+                pass
             os.unlink(lockfile)
 
     if options.verbose:
@@ -214,7 +208,6 @@ def main():
     if operation == 'start':
         if options.verbose: print "Starting monitor: Reading options..." 
         # get options from conf file
-        if not os.path.exists(configfile): raise Exception("No cronish file: %s" % configfile)
         config = ConfigParser.ConfigParser()
         config.read(configfile)
         if not config.has_section(jobname): raise Exception("No job in config file.")
@@ -224,9 +217,6 @@ def main():
         if config.has_option(jobname, 'script'):
             script = config.get(jobname, 'script')
         else: raise Exception ("Need a script option in config")
-        if config.has_option(jobname, 'poll'):
-            poll = config.getfloat(jobname, 'poll')
-        else: poll=30
         if config.has_option(jobname, 'timeout'):
             timeout = config.getfloat(jobname, 'timeout')
         else: timeout=3600
@@ -239,14 +229,15 @@ def main():
             plock=Plock(lockfile)
             if options.verbose: print "Create lockfile (%s)" % lockfile
         except PlockPresent, err:
-            raise Exception ("Could not create lockfile (%s)" % lockfile)
+            raise Exception ("Already running. Lockfile present (%s)" % lockfile)
             
         if options.verbose: print "Starting monitor: makeing monitor and starting job..."     
         try:
-            m = Monitor(jobname,freq, script, options.verbose, poll, timeout, wait)
+            m = Monitor(jobname,freq, script, options.verbose, timeout, wait)
             m.start()
-        except: 
+        except Exception as e: 
             plock.release()   
+            raise e
 
 if __name__ == "__main__":
     main()	
