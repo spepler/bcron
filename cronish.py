@@ -78,6 +78,7 @@ class Plock:
         
     def release(self):
         ''' release remove lock file to release lock'''
+        print "release"
         os.unlink(self.filename)
 
   
@@ -235,10 +236,11 @@ def main():
         try:
             m = Monitor(jobname,freq, script, options.verbose, timeout, wait)
             m.start()
-        except Exception as e: 
+        finally: 
+            print "finally!"
             plock.release()   
-            raise e
 
+        
 if __name__ == "__main__":
     main()	
 	    
