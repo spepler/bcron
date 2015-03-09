@@ -98,8 +98,8 @@ class Monitor:
 
         if email_on_start:
             msg = "Subject: %s\n\nJob %s (re)started ob cronish.py at %s" % (jobname, jobname, datetime.datetime.now())
-            s = smtplib.SMTP('localhost')
-            s.sendmail(email_on_start, email_on_start, msg.as_string())
+            s = smtplib.SMTP('tranquil')
+            s.sendmail(email_on_start, email_on_start, msg)
             s.quit()
 
     def start(self):
