@@ -42,7 +42,7 @@
 # 2014 Nov - revised to work with cron as starter - cronish
 
 
-import time, os, subprocess, signal, sys, ConfigParser
+import time, os, subprocess, signal, sys, ConfigParser, smtplib, datetime
 
 #-------------------------------------
 ''' module plock: simple process locking.
@@ -81,20 +81,26 @@ class Plock:
         os.unlink(self.filename)
 
   
-#----------------------------------------------
+# ----------------------------------------------
 class Monitor:
-    '''Class to repeated run jobs then wait to run next job'''
+    """Class to repeated run jobs then wait to run next job"""
 
-    def __init__(self,jobname, freq, script, verbose, timeout, wait):
+    def __init__(self,jobname, freq, script, verbose, timeout, wait, email_on_start):
         self.polls=0
         self.verbose = verbose
         self.timeout = timeout
         self.wait = wait
         self.freq=freq
-	self.script=script
+        self.script=script
         self.jobname = jobname
         self.started = time.time()
         self.jobs=0
+
+        if email_on_start:
+            msg = "Subject: %s\n\nJob %s (re)started ob cronish.py at %s" % (jobname, jobname, datetime.datetime.now())
+            s = smtplib.SMTP('localhost')
+            s.sendmail(email_on_start, email_on_start, msg.as_string())
+            s.quit()
 
     def start(self):
         
@@ -111,21 +117,21 @@ class Monitor:
             time.sleep(nextjobstart - time.time())  
                                     
 
-
-#-------------------------------
+# -------------------------------
 class Job: 
 
     def __init__(self,script, timeout):
         self.start_time=time.time()
         self.polls = 0
         self.timeout=timeout
-	self.process = subprocess.Popen(script, shell=True, bufsize=4096)
-	self.script=script
-	self.killed = 0
-	self.returncode = None
-	self.cwd = os.getcwd()
+        self.process = subprocess.Popen(script, shell=True, bufsize=4096)
+        self.script=script
+        self.killed = 0
+        self.returncode = None
+        self.cwd = os.getcwd()
 
-    def runtime(self): return time.time()-self.start_time
+    def runtime(self):
+        return time.time()-self.start_time
 
     def pid(self):
         if os.name == "nt": return "WINDOWS no pid"
@@ -133,31 +139,34 @@ class Job:
 
     def kill(self):
         os.kill(self.process.pid,signal.SIGKILL)     
-	time.sleep(1)
-	self.killed=1
+        time.sleep(1)
+        self.killed=1
 
     def do(self):
         #  loop until process stops.  If time out is reached kill process 
         poll = 1.0
         while 1: 
-	    self.returncode = self.process.poll()
-	    self.polls +=1		
-	    if self.returncode == None and self.runtime() < self.timeout: 
-	        time.sleep(poll)
-	        poll = 1.1*poll
-	    elif self.returncode == None: self.kill()
-	    else: break		
-	self.end_time=time.time()
+            self.returncode = self.process.poll()
+            self.polls +=1
+            if self.returncode is not None and self.runtime() < self.timeout:
+                time.sleep(poll)
+                poll = 1.1*poll
+            elif self.returncode is not None:
+                self.kill()
+            else:
+                break
+        self.end_time=time.time()
 
-#-----------------------------------
+# -----------------------------------
 from optparse import OptionParser
+
 
 def main():
     usage = """usage: %prog [options] start|stop <jobname1>
-  start        Starts job sequence. If the job is already going it will not start a new one"
-  stop         Stop a job sequence.     
-  -l, --list   list jobs in config file.
-  -v           verbose          """
+     start        Starts job sequence. If the job is already going it will not start a new one"
+     stop         Stop a job sequence.
+     -l, --list   list jobs in config file.
+     -v           verbose          """
     parser = OptionParser(usage)
     parser.add_option("-v", "--verbose", action="count", dest="verbose")
     parser.add_option("-l", "--list", action="store_true", dest="list", help="list jobs")
@@ -189,7 +198,7 @@ def main():
     jobname = args[1]    
 
     lockfile=os.path.join(cronish_dir, "%s.lock" % jobname)
-	           
+
     if operation == 'stop':
         if options.verbose: print "Stopping monitor."     
         if os.path.islink(lockfile):
@@ -223,20 +232,25 @@ def main():
         if config.has_option(jobname, 'wait'):
             wait = config.getfloat(jobname, 'wait')
         else: wait=0
-    
+        if config.has_option(jobname, 'email_on_start'):
+            email_on_start = config.getfloat(jobname, 'email_on_start')
+        else: email_on_start = None
+
         if options.verbose: print "Starting monitor: creating lockfile..."     
         try:
             plock=Plock(lockfile)
             if options.verbose: print "Create lockfile (%s)" % lockfile
         except PlockPresent, err:
-            raise Exception ("Already running. Lockfile present (%s)" % lockfile)
+            if options.verbose: print "Already running (so just exit quietly). Lockfile present (%s)." % lockfile
+            sys.exit()
+
             
         if options.verbose: print "Starting monitor: makeing monitor and starting job..."     
         try:
-            m = Monitor(jobname,freq, script, options.verbose, timeout, wait)
+            m = Monitor(jobname,freq, script, options.verbose, timeout, wait, email_on_start)
             m.start()
         finally: 
-            if options.verbose: print "Existing: Release lock"
+            if options.verbose: print "Exiting: Release lock"
             plock.release()   
 
         
