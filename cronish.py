@@ -233,7 +233,7 @@ def main():
             wait = config.getfloat(jobname, 'wait')
         else: wait=0
         if config.has_option(jobname, 'email_on_start'):
-            email_on_start = config.getfloat(jobname, 'email_on_start')
+            email_on_start = config.get(jobname, 'email_on_start')
         else: email_on_start = None
 
         if options.verbose: print "Starting monitor: creating lockfile..."     
